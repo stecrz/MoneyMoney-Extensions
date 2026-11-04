@@ -7,18 +7,32 @@
 -- ein Konto/Depot in MoneyMoney an. Nichts ist fest verdrahtet: weder
 -- Vertragsnummern noch ISINs noch Produktnamen -- alles wird generisch aus
 -- der ERGO-JSON-API gelesen. Anmeldedaten sind Benutzername und Passwort
--- des ERGO Kundenportals.
+-- des ERGO Kundenportals; der SMS-Code (Zwei-Faktor) wird bei jeder
+-- Anmeldung in einem MoneyMoney-Dialog abgefragt.
 --
 -- FUNKTIONSWEISE
 --   1. GET kunde-s.ergo.de -> Redirect-Kette zum ForgeRock-Login (ciam.ergo.com)
 --   2. POST /am/json/.../authenticate (leer)      -> authId + Callbacks
---   3. POST /am/json/.../authenticate (befuellt)  -> tokenId, SSO-Cookie
---      (zweiter Faktor wird unterstuetzt, falls das Konto ihn verlangt)
+--   3. Callback-Baum generisch abarbeiten:
+--        NameCallback/PasswordCallback  -> Benutzername/Passwort
+--        ConfirmationCallback           -> Hinweisseite ("Verstanden") bestaetigen,
+--                                          Text als ERGO-Hinweis merken
+--        TextInputCallback "SMS-Kennwort" -> MoneyMoney-Dialog, Code vom Nutzer
+--        TextOutputCallback             -> Hinweise sammeln (JS ignorieren)
+--      ... bis tokenId (SSO-Cookie) vorliegt
 --   4. OAuth2-form_post-Formulare automatisch absenden bis zum Dashboard
---   5. __RequestVerificationToken aus dem HTML ziehen
---   6. GET apps.kunde-s.ergo.de/prod/api/v1/contracts  -> Vertragsliste
---   7. POST /meineversicherungen/L1/api/spa {"contractDetails":[{...}]}
+--   5. Geaenderte Nutzungsbedingungen (Portalbedingungen.aspx) erkennen:
+--      je nach TERMS_MODE in MoneyMoney zur Zustimmung vorlegen, automatisch
+--      zustimmen oder mit Hinweis abbrechen
+--   6. __RequestVerificationToken aus dem HTML ziehen
+--   7. GET apps.kunde-s.ergo.de/prod/api/v1/contracts  -> Vertragsliste
+--   8. POST /meineversicherungen/L1/api/spa {"contractDetails":[{...}]}
 --      -> Guthaben und Fondspositionen aus dem dataFields-Baum
+--
+-- HINWEIS ZUR ZWEI-FAKTOR-AUTHENTIFIZIERUNG
+--   ERGO verlangt seit 2026 bei JEDER Anmeldung einen SMS-Code. Eine
+--   automatische Hintergrund-Aktualisierung ohne Nutzer ist damit technisch
+--   nicht moeglich; das Konto wird beim manuellen Aktualisieren abgefragt.
 --
 -- INSTALLATION
 --   Signierte Version: einfach in den Extensions-Ordner legen.
@@ -28,13 +42,18 @@
 --   Danach: Konto hinzufuegen > Andere > ERGO Kundenportal
 --
 -- Fehlersuche: DEBUG unten auf true setzen, dann Fenster > Protokollfenster.
--- Lizenz: MIT. Ohne Gewaehr, keine Verbindung zur ERGO Group AG.
+-- Lizenz: CC0 1.0 (Public-Domain-Freigabe). Soweit rechtlich moeglich, wird
+-- auf alle Urheber- und verwandten Rechte an dieser Software verzichtet. Sie
+-- wird OHNE JEDE GEWAEHR bereitgestellt. Lizenztext:
+-- https://creativecommons.org/publicdomain/zero/1.0/
+-- Keine Verbindung zur ERGO Group AG oder zu MRH applications (MoneyMoney).
 
 WebBanking{
-  version     = 1.07,
+  version     = 1.08,
   url         = "https://kunde-s.ergo.de/",
   services    = {"ERGO Kundenportal"},
-  description = "Vertragsguthaben und Fondsdepots aus dem ERGO Kundenportal (ERGO/DKV)"
+  description = "Vertragsguthaben und Fondsdepots aus dem ERGO Kundenportal (ERGO/DKV). " ..
+                "Anmeldung mit Benutzername, Passwort und SMS-Code (Zwei-Faktor)."
 }
 
 -- ---------------------------------------------------------------------------
@@ -56,17 +75,36 @@ local PORTFOLIO_MODE = true
 --        mit Guthaben, damit die Kontenliste nicht mit Nullwerten zulaeuft.
 local INCLUDE_ALL_CONTRACTS = false
 
+-- Umgang mit geaenderten Nutzungsbedingungen. ERGO legt sie NUR dann vor,
+-- wenn sie sich geaendert haben und noch nicht bestaetigt wurden (einmalig je
+-- Aenderung, nicht bei jedem Login); ohne Zustimmung ist das Portal gesperrt.
+--   "ask"   : Text der Aenderung im MoneyMoney-Dialog anzeigen. Eingabe "ja"
+--             = Zustimmung direkt aus MoneyMoney. Jede andere Eingabe (auch
+--             leer) = nicht zustimmen; der Abruf wird trotzdem versucht und
+--             erst bei Misserfolg erscheint der Hinweis, im Browser
+--             zuzustimmen. (Standard)
+--   "auto"  : automatisch zustimmen; der Text landet nur im Protokoll.
+--   "never" : nie fragen, nie zustimmen; Abruf trotzdem versuchen, bei
+--             Misserfolg Hinweis mit dem Text der Aenderung.
+local TERMS_MODE = "ask"
+
+-- true : Hinweise, die ERGO waehrend der Anmeldung einblendet (z.B. die
+--        Information zur Zwei-Faktor-Einfuehrung), im SMS-Dialog mit
+--        anzeigen. Sie erscheinen in jedem Fall im Protokollfenster.
+local SHOW_NOTICES = true
+
 -- true : ausfuehrliche Protokollausgaben (Rohantworten, Feldlaengen der
 --        Zugangsdaten, Quellen-Trefferzahlen). Fuer den Normalbetrieb aus,
 --        fuer die Fehlersuche an. Fehlermeldungen erscheinen immer.
 local DEBUG = false
 
-local BASE     = "https://kunde-s.ergo.de"
-local CIAM     = "https://ciam.ergo.com"
-local APPS_URL = "https://apps.kunde-s.ergo.de/prod/api/v1/contracts"
-local AUTH_URL = CIAM .. "/am/json/realms/root/realms/customerportal/authenticate"
-local API_URL  = BASE .. "/meineversicherungen/L1/api/spa"
-local LOGOUT   = CIAM .. "/am/UI/Logout?realm=/customerportal"
+local BASE      = "https://kunde-s.ergo.de"
+local CIAM      = "https://ciam.ergo.com"
+local APPS_URL  = "https://apps.kunde-s.ergo.de/prod/api/v1/contracts"
+local AUTH_URL  = CIAM .. "/am/json/realms/root/realms/customerportal/authenticate"
+local API_URL   = BASE .. "/meineversicherungen/L1/api/spa"
+local DASHBOARD = BASE .. "/meineversicherungen/L1/Startseite/Dashboard.aspx"
+local LOGOUT    = CIAM .. "/am/UI/Logout?realm=/customerportal"
 
 -- Notnagel: Falls die automatische Vertragserkennung leer bleibt, hier die
 -- Werte aus der URL der Detailseite eintragen (?vnr=...&verwSysSl=...).
@@ -95,18 +133,26 @@ local BALANCE_KEYS = {
   "guthaben"
 }
 
+-- Positive Antwortoptionen einer ForgeRock-Bestaetigungsseite (Kleinschreibung)
+local POSITIVE_OPTIONS = {
+  "verstanden", "ok", "weiter", "ja", "yes", "akzeptieren", "zustimmen",
+  "bestätigen", "bestaetigen", "submit", "continue", "accept", "fortfahren"
+}
+
 local function dbg (...) if DEBUG then print(...) end end
 
 -- ---------------------------------------------------------------------------
 -- Zustand
 -- ---------------------------------------------------------------------------
 
-local connection   = nil
-local rvToken      = nil
-local contracts    = nil   -- { {vnr=, verwSysSl=}, ... }
-local contractMeta = {}    -- normVnr -> {product, owner, company, status, currency, bankBalance}
-local detailsCache = {}    -- vnr -> geparste Detaildaten
-local pendingAuth  = nil   -- fuer optionalen zweiten Faktor
+local connection      = nil
+local rvToken         = nil
+local contracts       = nil   -- { {vnr=, verwSysSl=}, ... }
+local contractMeta    = {}    -- normVnr -> {product, owner, company, status, currency, bankBalance}
+local detailsCache    = {}    -- vnr -> geparste Detaildaten
+local lastRawResponse = nil
+local pending         = nil   -- offener Dialogschritt: {kind="otp", auth=} | {kind="terms", page=}
+local notices         = {}    -- waehrend der Anmeldung gesammelte ERGO-Hinweise
 
 -- ---------------------------------------------------------------------------
 -- HTTP
@@ -132,28 +178,39 @@ local function headerValue (headers, name)
   return nil
 end
 
+-- Relative Location-Angabe gegen die Ausgangs-URL aufloesen; http->https
+local function resolveLocation (base, loc)
+  if loc:match("^https?://") then
+    return (loc:gsub("^http://", "https://"))
+  end
+  local origin = base:match("^(https?://[^/]+)") or BASE
+  if loc:sub(1, 1) == "/" then return origin .. loc end
+  return origin .. "/" .. loc
+end
+
 -- Request mit defensiver Redirect-Verfolgung. MoneyMoney folgt Redirects in
 -- der Regel selbst; falls nicht, uebernimmt das diese Schleife.
 local function request (method, url, body, contentType, headers)
   local content, charset, mimeType, filename, respHeaders =
     conn():request(method, url, body, contentType, headers)
 
-  local hops = 0
+  local hops, current = 0, url
   while hops < 10 do
     local loc = headerValue(respHeaders, "location")
     if loc == nil or loc == "" then break end
     hops = hops + 1
+    current = resolveLocation(current, loc)
     content, charset, mimeType, filename, respHeaders =
-      conn():request("GET", loc, nil, nil, headers)
+      conn():request("GET", current, nil, nil, headers)
   end
 
   return content, charset, mimeType, respHeaders
 end
 
 local JSON_HEADERS = {
-  ["Accept"]           = "application/json",
+  ["Accept"]             = "application/json",
   ["Accept-API-Version"] = "protocol=1.0,resource=2.1",
-  ["X-Requested-With"] = "forgerock-sdk"
+  ["X-Requested-With"]   = "forgerock-sdk"
 }
 
 local function postJSON (url, tbl, headers)
@@ -189,6 +246,38 @@ local function cleanText (s)
   if type(s) ~= "string" then return nil end
   s = s:gsub("\194\173", "")
   s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" then return nil end
+  return s
+end
+
+-- HTML-Entities aufloesen (benannte + numerische)
+local function decodeEntities (s)
+  if type(s) ~= "string" then return s end
+  s = s:gsub("&nbsp;", " "):gsub("&quot;", '"'):gsub("&#39;", "'")
+       :gsub("&lt;", "<"):gsub("&gt;", ">")
+  if utf8 and utf8.char then
+    s = s:gsub("&#(%d+);", function (n)
+      local ok, c = pcall(utf8.char, tonumber(n))
+      return ok and c or ""
+    end)
+  end
+  s = s:gsub("&amp;", "&")
+  return s
+end
+
+-- HTML -> lesbarer Klartext fuer MoneyMoney-Dialoge und das Protokoll
+local function stripHtml (s)
+  if type(s) ~= "string" then return nil end
+  s = s:gsub("<script.-</script>", ""):gsub("<style.-</style>", "")
+  s = s:gsub("[\r\n\t]+", " ")   -- Zeilenumbrueche im HTML-Quelltext sind unbedeutend
+  s = s:gsub("<br%s*/?>", "\n"):gsub("</p>", "\n"):gsub("</h%d>", "\n")
+       :gsub("</li>", "\n"):gsub("<li[^>]*>", "- "):gsub("</ul>", "\n")
+       :gsub("</ol>", "\n"):gsub("</div>", "\n")
+  s = s:gsub("<[^>]+>", "")
+  s = decodeEntities(s)
+  s = s:gsub("\194\173", "")
+  s = s:gsub("[ \t\r]+", " "):gsub(" *\n *", "\n"):gsub("\n\n\n+", "\n\n")
+       :gsub("^%s+", ""):gsub("%s+$", "")
   if s == "" then return nil end
   return s
 end
@@ -306,92 +395,416 @@ local function findContracts (node, out, seen)
 end
 
 -- ---------------------------------------------------------------------------
--- Anmeldung
+-- ERGO-Hinweise (Meldungen waehrend der Anmeldung)
 -- ---------------------------------------------------------------------------
 
--- Formulare der OAuth2-form_post-Antworten absenden, bis das Portal antwortet
-local function followFormPost (content)
-  local hops = 0
-  while hops < 6 do
-    if content == nil then return nil end
+local function addNotice (text)
+  text = stripHtml(text)
+  if text == nil or text == "" or text == "." then return end
+  for _, n in ipairs(notices) do
+    if n == text then return end
+  end
+  table.insert(notices, text)
+  print("ERGO-Hinweis: " .. text:gsub("\n+", " | "))
+end
 
-    local token = content:match('name="__RequestVerificationToken"[^>]-value="([^"]*)"')
-                  or content:match('value="([^"]*)"[^>]-name="__RequestVerificationToken"')
-    if token ~= nil and token ~= "" then return token end
+local function noticesText ()
+  if not SHOW_NOTICES or #notices == 0 then return "" end
+  return "Hinweis von ERGO:\n" .. table.concat(notices, "\n\n") .. "\n\n"
+end
 
-    local html = HTML(content)
-    local form = html:xpath("//form")
-    if form:length() == 0 then return nil end
+-- ---------------------------------------------------------------------------
+-- Anmeldung: ForgeRock-Callback-Baum
+-- ---------------------------------------------------------------------------
 
-    hops = hops + 1
-    content = request(form:submit())
+local function cbOutput (cb, name)
+  for _, o in ipairs(cb["output"] or {}) do
+    if o["name"] == name then return o["value"] end
   end
   return nil
 end
 
-local function fetchRequestVerificationToken ()
-  local content = request("GET", BASE .. "/")
-  local token = followFormPost(content)
-  if token == nil then
-    content = request("GET", BASE .. "/meineversicherungen/L1/Startseite/Dashboard.aspx")
-    token = followFormPost(content)
-  end
-  return token
+local function setInputs (cb, value)
+  for _, inp in ipairs(cb["input"] or {}) do inp["value"] = value end
 end
 
--- Callbacks typbasiert befuellen: NameCallback -> Benutzername,
--- PasswordCallback -> Passwort. Robuster als reine Reihenfolge.
--- Loggt, OB die Felder befuellt wurden (Laenge, nicht der Wert) -- zur
--- Unterscheidung "falsche Zugangsdaten" vs. "leere Felder uebergeben".
-local function submitCredentials (auth, username, password)
+local function positiveOption (options)
+  if type(options) ~= "table" then return 0 end
+  for idx, opt in ipairs(options) do
+    local o = tostring(opt):lower()
+    for _, p in ipairs(POSITIVE_OPTIONS) do
+      if o == p then return idx - 1 end
+    end
+  end
+  return 0
+end
+
+local function looksLikeOtp (prompt)
+  local p = (prompt or ""):lower()
+  return p:find("sms") or p:find("otp") or p:find("one time") or p:find("one-time")
+      or p:find("einmal") or p:find("code") or p:find("tan") or p:find("kennwort")
+      or p:find("sicherheits")
+end
+
+-- Callbacks eines Knotens befuellen.
+-- creds = {username=, password=, code=}; creds.code wird beim Verbrauch auf
+-- nil gesetzt. Liefert (needsInput, label): needsInput=true, wenn ein Wert
+-- vom Nutzer fehlt (dann ist label die Feldbezeichnung).
+local function fillCallbacks (auth, creds)
+  local needsInput, label = false, nil
+  local texts = {}
+  local codeUsed = false
+
   for _, cb in ipairs(auth["callbacks"] or {}) do
     local t = cb["type"]
-    for _, inp in ipairs(cb["input"] or {}) do
-      if t == "PasswordCallback" then
-        inp["value"] = password
-      elseif t == "NameCallback" then
-        inp["value"] = username
+    local prompt = cbOutput(cb, "prompt")
+
+    if t == "TextOutputCallback" then
+      local mt = tostring(cbOutput(cb, "messageType") or "0")
+      if mt ~= "4" then table.insert(texts, cbOutput(cb, "message")) end   -- 4 = JavaScript
+
+    elseif t == "NameCallback" then
+      local p = (prompt or ""):lower()
+      if creds.username ~= nil
+         and (p:find("user") or p:find("benutzer") or p:find("login") or p == "name") then
+        setInputs(cb, creds.username)
+      elseif creds.code ~= nil then
+        setInputs(cb, creds.code); creds.code = nil; codeUsed = true
+      else
+        needsInput, label = true, (prompt or "Code")
+      end
+
+    elseif t == "PasswordCallback" then
+      local p = (prompt or ""):lower()
+      if creds.password ~= nil and not looksLikeOtp(p) then
+        setInputs(cb, creds.password)
+      elseif creds.code ~= nil then
+        setInputs(cb, creds.code); creds.code = nil; codeUsed = true
+      else
+        needsInput, label = true, (prompt or "Code")
+      end
+
+    elseif t == "TextInputCallback" then
+      if creds.code ~= nil then
+        setInputs(cb, creds.code); creds.code = nil; codeUsed = true
+      else
+        needsInput, label = true, (prompt or "SMS-Kennwort")
+      end
+
+    elseif t == "ConfirmationCallback" then
+      setInputs(cb, positiveOption(cbOutput(cb, "options")))
+      addNotice(auth["header"])
+      addNotice(auth["description"])
+
+    elseif t == "ChoiceCallback" then
+      setInputs(cb, cbOutput(cb, "defaultChoice") or 0)
+
+    elseif t == "HiddenValueCallback" or t == "MetadataCallback"
+        or t == "SuspendedTextOutputCallback" or t == "PollingWaitCallback" then
+      -- unveraendert zuruecksenden
+
+    else
+      if cb["input"] ~= nil and #cb["input"] > 0 then
+        error("Nicht unterstuetzter Anmeldeschritt von ERGO: " .. tostring(t))
       end
     end
   end
 
+  -- Texte eines Knotens, der als Dialog angezeigt wurde oder wird, nicht
+  -- zusaetzlich als Hinweis merken (sonst erschienen sie doppelt).
+  if not needsInput and not codeUsed then
+    for _, m in ipairs(texts) do addNotice(m) end
+  end
+
+  return needsInput, label
+end
+
+-- Protokolliert, OB Zugangsdatenfelder befuellt wurden (Laenge, nicht Wert)
+local function logFilled (auth)
+  if not DEBUG then return end
   for _, cb in ipairs(auth["callbacks"] or {}) do
     for _, inp in ipairs(cb["input"] or {}) do
       local v = inp["value"]
-      local filled = (type(v) == "string" and v ~= "")
-      dbg(string.format("  %s.%s befuellt: %s (%d Zeichen)",
-        tostring(cb["type"]), tostring(inp["name"]),
-        filled and "ja" or "NEIN", (type(v) == "string") and #v or 0))
+      dbg(string.format("  %s.%s = %s", tostring(cb["type"]), tostring(inp["name"]),
+        (type(v) == "string") and (#v .. " Zeichen") or tostring(v)))
     end
   end
-
-  return postJSON(AUTH_URL, auth, JSON_HEADERS)
 end
 
--- Antwort auf einen weiteren Faktor (Reihenfolge, da generisch)
-local function submitCallbacks (auth, values)
-  local i = 1
+-- Dialogtext fuer den aktuellen Knoten (Ueberschrift, Beschreibung, Hinweise)
+local function promptText (auth)
+  local parts = {}
+  local h = stripHtml(auth["header"]); if h then table.insert(parts, h) end
+  local d = stripHtml(auth["description"]); if d then table.insert(parts, d) end
   for _, cb in ipairs(auth["callbacks"] or {}) do
-    for _, inp in ipairs(cb["input"] or {}) do
-      if values[i] ~= nil then
-        inp["value"] = values[i]
-        i = i + 1
+    if cb["type"] == "TextOutputCallback"
+       and tostring(cbOutput(cb, "messageType") or "0") ~= "4" then
+      local m = stripHtml(cbOutput(cb, "message"))
+      if m and m ~= "." then table.insert(parts, m) end
+    end
+  end
+  return table.concat(parts, "\n")
+end
+
+-- Den Callback-Baum abarbeiten, bis ein tokenId vorliegt oder Nutzereingabe
+-- noetig ist. Liefert:
+--   "ok",     auth                         (tokenId vorhanden)
+--   "prompt", {text=, label=, auth=}       (Nutzereingabe noetig)
+--   "failed", meldung
+local function runAuthTree (auth, creds)
+  for step = 1, 12 do
+    if auth == nil then return "failed", "Keine Antwort vom Anmeldeserver." end
+
+    if auth["tokenId"] ~= nil then return "ok", auth end
+
+    if auth["callbacks"] == nil then
+      local code = auth["code"]
+      local msg  = auth["message"]
+      if code == 401 or code == "401" then
+        return "failed", "401:" .. tostring(msg)
+      end
+      return "failed", "Anmeldefehler: " .. tostring(msg or auth["reason"] or "unbekannt")
+    end
+
+    -- Wartenknoten (z.B. Push-Freigabe): kurz warten, dann erneut senden
+    for _, cb in ipairs(auth["callbacks"]) do
+      if cb["type"] == "PollingWaitCallback" then
+        local ms = tonumber(cbOutput(cb, "waitTime")) or 3000
+        MM.sleep(ms / 1000)
+      end
+    end
+
+    local text = promptText(auth)
+    local needsInput, label = fillCallbacks(auth, creds)
+    if needsInput then
+      return "prompt", {text = text, label = label, auth = auth}
+    end
+
+    -- Felder des Knotens vor dem Senden aufraeumen (Browser sendet sie nicht)
+    auth["status"] = nil; auth["ok"] = nil
+
+    logFilled(auth)
+    dbg("Anmeldeschritt " .. step .. " senden")
+    auth = postJSON(AUTH_URL, auth, JSON_HEADERS)
+  end
+  return "failed", "Anmeldung hat zu viele Schritte."
+end
+
+-- ---------------------------------------------------------------------------
+-- Anmeldung: Portal oeffnen, Nutzungsbedingungen, Verifikations-Token
+-- ---------------------------------------------------------------------------
+
+local function extractRvToken (content)
+  if type(content) ~= "string" then return nil end
+  local token = content:match('name="__RequestVerificationToken"[^>]-value="([^"]*)"')
+                or content:match('value="([^"]*)"[^>]-name="__RequestVerificationToken"')
+  if token ~= nil and token ~= "" then return token end
+  return nil
+end
+
+local function isTermsPage (content)
+  return type(content) == "string"
+     and content:find("__doPostBack", 1, true) ~= nil
+     and (content:find("Portalbedingungen", 1, true) ~= nil
+          or content:find("Nutzungsbedingungen", 1, true) ~= nil)
+     and content:match(">%s*Zustimmen%s*<") ~= nil
+end
+
+-- Text der Nutzungsbedingungs-Seite fuer Dialog und Protokoll
+local function termsText (content)
+  local parts = {}
+  local h = stripHtml(content:match('<h1[^>]*id="headline"[^>]*>(.-)</h1>')
+                      or content:match("<h1[^>]*>(.-)</h1>"))
+  if h then table.insert(parts, h) end
+  local body = content:match('<div class="markeInfo">(.-)</div>')
+  if body == nil then
+    body = content:match('class="[^"]*page"[^>]*>(.-)<div class="button%-navigation')
+  end
+  local b = stripHtml(body)
+  if b then table.insert(parts, b) end
+  local pdf = content:match('href="(https?://[^"]*Nutzungsbedingungen[^"]*%.pdf)"')
+  if pdf then table.insert(parts, "Dokument: " .. pdf) end
+  if #parts == 0 then
+    table.insert(parts, "ERGO verlangt die Zustimmung zu geaenderten Nutzungsbedingungen.")
+  end
+  return table.concat(parts, "\n\n")
+end
+
+-- Nutzungsbedingungen per ASP.NET-Postback bestaetigen (Button "Zustimmen").
+-- Alle versteckten Formularfelder werden uebernommen, __EVENTTARGET auf das
+-- Postback-Ziel des Zustimmen-Links gesetzt.
+local function acceptTerms (content)
+  local target = content:match("__doPostBack%(&#39;([^&]-)&#39;,&#39;&#39;%)\"[^>]*>%s*Zustimmen")
+              or content:match("__doPostBack%('([^']-)',''%)\"[^>]*>%s*Zustimmen")
+  if target == nil then
+    return nil, "Zustimmen-Schaltflaeche nicht gefunden."
+  end
+
+  local action = content:match('<form[^>]*id="aspnetForm"[^>]*action="([^"]*)"')
+              or content:match('<form[^>]*action="([^"]*)"[^>]*id="aspnetForm"')
+              or "/meineversicherungen/L1/Formulare/Allgemein/Portalbedingungen.aspx?m=1"
+  action = decodeEntities(action)
+  local url = resolveLocation(BASE, action)
+
+  local fields, seen = {}, {}
+  for tag in content:gmatch("<input[^>]*>") do
+    if tag:find('type="hidden"', 1, true) then
+      local name  = tag:match('name="([^"]*)"')
+      local value = tag:match('value="([^"]*)"') or ""
+      if name and not seen[name] then
+        seen[name] = true
+        table.insert(fields, {name = name, value = decodeEntities(value)})
       end
     end
   end
-  return postJSON(AUTH_URL, auth, JSON_HEADERS)
+  if not seen["__EVENTTARGET"] then table.insert(fields, {name = "__EVENTTARGET", value = ""}) end
+  if not seen["__EVENTARGUMENT"] then table.insert(fields, {name = "__EVENTARGUMENT", value = ""}) end
+
+  local body = {}
+  for _, f in ipairs(fields) do
+    local v = f.value
+    if f.name == "__EVENTTARGET" then v = target end
+    table.insert(body, MM.urlencode(f.name) .. "=" .. MM.urlencode(v))
+  end
+
+  dbg("Nutzungsbedingungen: Zustimmen an " .. url .. " (" .. #fields .. " Felder)")
+  local result = request("POST", url, table.concat(body, "&"),
+                         "application/x-www-form-urlencoded",
+                         {["Origin"] = BASE, ["Referer"] = url})
+  return result, nil
 end
 
--- Prompt des naechsten Callbacks fuer die Anzeige in MoneyMoney
-local function callbackPrompt (auth)
-  for _, cb in ipairs(auth["callbacks"] or {}) do
-    for _, out in ipairs(cb["output"] or {}) do
-      if out["name"] == "prompt" and type(out["value"]) == "string" then
-        return out["value"]
-      end
+-- Vom aktuellen Seiteninhalt aus bis zum Dashboard laufen.
+-- Liefert ("token", rvToken) | ("terms", html) | ("fail", nil)
+local function walkToPortal (content)
+  for hop = 1, 8 do
+    if type(content) ~= "string" then return "fail", nil end
+
+    local token = extractRvToken(content)
+    if token ~= nil then return "token", token end
+
+    if isTermsPage(content) then return "terms", content end
+
+    -- OAuth2-form_post (id_token/code/state) automatisch absenden
+    if content:find('name="id_token"', 1, true) or content:find('name="code"', 1, true)
+       or content:find('name="state"', 1, true) then
+      local html = HTML(content)
+      local form = html:xpath("//form")
+      if form:length() == 0 then return "fail", nil end
+      dbg("form_post absenden (Schritt " .. hop .. ")")
+      content = request(form:submit())
+    elseif hop == 1 then
+      content = request("GET", DASHBOARD)
+    else
+      return "fail", nil
     end
   end
-  return "Bestaetigungscode"
+  return "fail", nil
+end
+
+-- Nach erfolgreichem ForgeRock-Login: Portal oeffnen.
+-- Liefert ("ok") | ("terms", html) | ("fail")
+local function openPortal (auth)
+  MM.printStatus("Portal oeffnen")
+
+  local function try (content)
+    local state, payload = walkToPortal(content)
+    if state == "token" then rvToken = payload end
+    return state, payload
+  end
+
+  -- 1. Weg wie der Browser: successUrl (OAuth2-Code-Flow des Auth-Service),
+  --    der ueber start.aspx zum form_post des Portals fuehrt
+  local su = auth and auth["successUrl"]
+  if type(su) == "string" and su:find("oauth2", 1, true) then
+    local ok, c = pcall(function () return (request("GET", su)) end)
+    if ok and type(c) == "string" and c ~= "" then
+      local state, payload = try(c)
+      if state ~= "fail" then return state == "token" and "ok" or state, payload end
+    end
+  end
+
+  -- 2. Weg: Portal-Einstieg (loest mit SSO-Cookie denselben form_post aus)
+  local state, payload = try(request("GET", BASE .. "/"))
+  if state ~= "fail" then return state == "token" and "ok" or state, payload end
+
+  -- 3. Weg: Dashboard direkt
+  state, payload = try(request("GET", DASHBOARD))
+  if state ~= "fail" then return state == "token" and "ok" or state, payload end
+  return "fail"
+end
+
+-- Nutzungsbedingungen gemaess TERMS_MODE behandeln.
+-- Liefert nil (fertig, rvToken gesetzt), ein Dialog-Table oder einen Fehlertext.
+-- Bestaetigung per Postback senden und bis zum Dashboard laufen.
+-- Liefert nil (fertig, rvToken gesetzt) oder einen Fehlertext.
+local function acceptAndOpen (page, how)
+  local result, err = acceptTerms(page)
+  if err then return "Nutzungsbedingungen konnten nicht bestaetigt werden: " .. err end
+  local state, payload = walkToPortal(result)
+  if state ~= "token" then
+    state, payload = walkToPortal(request("GET", DASHBOARD))
+  end
+  if state == "token" then
+    rvToken = payload
+    print("Nutzungsbedingungen bestaetigt (" .. how .. ").")
+    return nil
+  end
+  if state == "terms" then
+    return "ERGO hat die Zustimmung nicht uebernommen. Bitte im Browser unter " ..
+           "kunde-s.ergo.de anmelden und dort zustimmen."
+  end
+  return "Nutzungsbedingungen bestaetigt, aber das Portal liefert keine Sitzung."
+end
+
+-- Ohne Zustimmung weiterversuchen; erst bei Misserfolg den Hinweis liefern.
+local function tryWithoutTerms (text)
+  local state, payload = walkToPortal(request("GET", DASHBOARD))
+  if state == "token" then rvToken = payload; return nil end
+  return "ERGO verlangt die Zustimmung zu geaenderten Nutzungsbedingungen; ohne " ..
+         "sie ist das Kundenportal gesperrt. Zustimmen: beim naechsten " ..
+         "Aktualisieren im Dialog \"ja\" eingeben oder im Browser unter " ..
+         "kunde-s.ergo.de.\n\n" .. text
+end
+
+-- Nutzungsbedingungen gemaess TERMS_MODE behandeln.
+-- Liefert nil (fertig, rvToken gesetzt), ein Dialog-Table oder einen Fehlertext.
+local function handleTerms (page, interactive)
+  local text = termsText(page)
+  print("ERGO verlangt Zustimmung zu geaenderten Nutzungsbedingungen:")
+  print(text:gsub("\n+", " | "))
+
+  if TERMS_MODE == "auto" then
+    return acceptAndOpen(page, "automatisch, TERMS_MODE = auto")
+  end
+
+  if TERMS_MODE == "never" or interactive == false then
+    return tryWithoutTerms(text)
+  end
+
+  -- "ask": in MoneyMoney vorlegen
+  pending = {kind = "terms", page = page}
+  return {
+    title     = "ERGO Kundenportal: Nutzungsbedingungen",
+    challenge = text .. "\n\nZum Zustimmen bitte \"ja\" eingeben. Jede andere " ..
+                "Eingabe lehnt ab; der Abruf wird dann ohne Zustimmung versucht.",
+    label     = "Zustimmen? (ja/nein)"
+  }
+end
+
+local function isYes (s)
+  s = tostring(s or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  return s == "ja" or s == "j" or s == "yes" or s == "y" or s == "ok"
+      or s == "zustimmen" or s == "akzeptieren" or s == "1" or s == "true"
+end
+
+-- Nach ForgeRock-Erfolg: Portal oeffnen und Nutzungsbedingungen behandeln.
+-- Liefert nil (fertig), Dialog-Table oder Fehlertext.
+local function completeLogin (auth, interactive)
+  local state, page = openPortal(auth)
+  if state == "ok" then return nil end
+  if state == "terms" then return handleTerms(page, interactive) end
+  return "Anmeldung erfolgreich, aber das Kundenportal hat keine Sitzung geliefert."
 end
 
 -- ---------------------------------------------------------------------------
@@ -502,7 +915,7 @@ local function ensureContracts ()
 
   -- Quelle 4: Postfach-Dashboard -- vnr/verwSysSl je Nachricht
   if #out == 0 then
-    local d = apiCall({dashboardList = true, unreadCount = true})
+    local d = apiCall({inbox = {dashboardList = true, unreadCount = true}})
     harvest("spa/dashboardList", d, lastRawResponse)
   end
 
@@ -597,10 +1010,24 @@ function SupportsBank (protocol, bankCode)
 end
 
 function InitializeSession2 (protocol, bankCode, step, credentials, interactive)
-  local auth
+  -- Offener Dialog: Zustimmung zu Nutzungsbedingungen
+  if step > 1 and pending ~= nil and pending.kind == "terms" then
+    local page = pending.page
+    pending = nil
+    if isYes(credentials[1]) then
+      MM.printStatus("Nutzungsbedingungen bestaetigen")
+      return acceptAndOpen(page, "in MoneyMoney")
+    end
+    print("Nutzungsbedingungen im Dialog nicht bestaetigt -- Abruf ohne Zustimmung wird versucht.")
+    return tryWithoutTerms(termsText(page))
+  end
+
+  local status, payload
 
   if step == 1 then
     MM.printStatus("Anmeldung bei ERGO")
+    pending = nil
+    notices = {}
 
     -- Zugangsdaten aus dem credentials-Array holen (positionsbasiert), mit
     -- benannten Feldern als Rueckfallebene, falls MoneyMoney anders liefert.
@@ -613,63 +1040,69 @@ function InitializeSession2 (protocol, bankCode, step, credentials, interactive)
       password = credentials["password"] or credentials["pass"] or password
     end
     dbg("credentials-Array: " .. tostring(#credentials) .. " Eintrag/Eintraege")
+    if type(username) ~= "string" or username == ""
+       or type(password) ~= "string" or password == "" then
+      print("Benutzername oder Passwort fehlt.")
+      return LoginFailed
+    end
 
     -- Redirect-Kette zum Login-Endpunkt aufbauen (setzt die noetigen Cookies)
     request("GET", BASE .. "/")
 
-    auth = postJSON(AUTH_URL, nil, JSON_HEADERS)
+    local auth = postJSON(AUTH_URL, nil, JSON_HEADERS)
     if auth == nil or auth["callbacks"] == nil then
       return "Login-Dialog von ERGO konnte nicht geladen werden."
     end
 
-    auth = submitCredentials(auth, username, password)
+    status, payload = runAuthTree(auth, {username = username, password = password})
   else
-    if pendingAuth == nil then return "Kein offener Anmeldevorgang." end
-    auth = submitCallbacks(pendingAuth, {credentials[1]})
-    pendingAuth = nil
+    -- Antwort auf den SMS-Code-Dialog
+    if pending == nil or pending.kind ~= "otp" then
+      return "Kein offener Anmeldevorgang -- bitte das Konto erneut aktualisieren."
+    end
+    local auth = pending.auth
+    pending = nil
+    MM.printStatus("SMS-Code pruefen")
+    status, payload = runAuthTree(auth, {code = tostring(credentials[1] or "")})
   end
 
-  if auth == nil then
-    return "Keine Antwort vom Anmeldeserver."
-  end
-
-  -- Zweiter Faktor angefordert
-  if auth["callbacks"] ~= nil and auth["tokenId"] == nil then
-    pendingAuth = auth
+  if status == "prompt" then
+    pending = {kind = "otp", auth = payload.auth}
+    if interactive == false then
+      return "ERGO verlangt bei jeder Anmeldung einen SMS-Code. Eine Aktualisierung " ..
+             "im Hintergrund ist daher nicht moeglich -- bitte das Konto manuell " ..
+             "aktualisieren und den Code eingeben."
+    end
+    local text = noticesText() .. (payload.text or "")
+    if text == "" then text = "Bitte den Code eingeben, den ERGO Ihnen gesendet hat." end
     return {
-      title     = "ERGO Kundenportal",
-      challenge = auth["description"] or callbackPrompt(auth),
-      label     = callbackPrompt(auth)
+      title     = "ERGO Kundenportal: " .. (payload.label or "Code"),
+      challenge = text,
+      label     = payload.label or "Code"
     }
   end
 
-  if auth["tokenId"] == nil then
-    local code = auth["code"]
-    local msg  = auth["message"]
-    if code == 401 or code == "401" then
-      print("ForgeRock lehnte die Zugangsdaten ab (code 401, message=" ..
-            tostring(msg) .. ").")
-      print("Falls die obigen Callback-Zeilen 'ja (>0 Zeichen)' zeigen, " ..
-            "stimmen Benutzername/Passwort nicht -- der ERGO-Benutzername " ..
-            "ist der bei der Registrierung gewaehlte Name, nicht die " ..
-            "Versicherungsnummer. Zum Test im Browser auf kunde-s.ergo.de " ..
-            "mit exakt diesen Daten anmelden.")
-      return LoginFailed
+  if status == "failed" then
+    local msg = tostring(payload)
+    local m401 = msg:match("^401:(.*)$")
+    if m401 then
+      if step == 1 then
+        print("ForgeRock lehnte die Zugangsdaten ab (401, message=" .. m401 .. ").")
+        print("Der ERGO-Benutzername ist der bei der Registrierung gewaehlte Name, " ..
+              "nicht die Versicherungsnummer. Zum Test im Browser auf kunde-s.ergo.de " ..
+              "mit exakt diesen Daten anmelden.")
+        return LoginFailed
+      end
+      return "ERGO hat den SMS-Code abgelehnt (abgelaufen oder falsch). Bitte das " ..
+             "Konto erneut aktualisieren und den neuen Code eingeben."
     end
-    if msg ~= nil then
-      print("Anmeldefehler: " .. tostring(msg))
-      return LoginFailed
-    end
-    return LoginFailed
+    print(msg)
+    if step == 1 then return LoginFailed end
+    return msg
   end
 
-  MM.printStatus("Portal oeffnen")
-  rvToken = fetchRequestVerificationToken()
-  if rvToken == nil then
-    return "Anmeldung erfolgreich, aber das Kundenportal hat keine Sitzung geliefert."
-  end
-
-  return nil
+  -- status == "ok": SSO-Token vorhanden -> Portal oeffnen
+  return completeLogin(payload, interactive)
 end
 
 function ListAccounts (knownAccounts)
@@ -779,9 +1212,9 @@ function EndSession ()
   contracts    = nil
   contractMeta = {}
   detailsCache = {}
+  pending      = nil
+  notices      = {}
   return nil
 end
 
-dbg("ERGO Kundenportal Extension geladen (v1.07)")
-
--- SIGNATURE: MC0CFQCJM//fOnkT54wh5XSzWmZ8AHPjoAIUe6f5tBewLWIJNixhon09oSMMOic=
+dbg("ERGO Kundenportal Extension geladen (v1.08)")
