@@ -2,13 +2,15 @@
 --
 -- MoneyMoney Web Banking Extension fuer WIWIN Crowdinvesting.
 --
--- WICHTIG -- richtiger Login-Weg:
---   Diese Extension nutzt AUSSCHLIESSLICH das WIWIN-Investoren-Kundenportal
---   unter  https://invest.wiwin.de/  (technisch betrieben ueber den Partner
---   Portagon). Ueber genau diesen Weg werden auch die Investitionen angezeigt,
---   die nur im Kundenportal sichtbar sind.
---   NICHT geeignet fuer den separaten Login unter wiwin-invest.de / wiwin.de.
---   Zugangsdaten = E-Mail und Passwort des invest.wiwin.de-Kontos.
+-- WICHTIG -- WIWIN hat zwei getrennte Investorenzugaenge:
+--   invest.wiwin.de  = WIWIN-Kundenportal, betrieben vom Partner Portagon.
+--                      Wertpapiere ueber die Portagon-Zeichnungsstrecke mit
+--                      Depot/Verrechnungskonto bei der Baader Bank (z.B.
+--                      Namensaktien, ELTIF, Fonds).  -> DIESE EXTENSION.
+--   wiwin-invest.de  = WIWINs eigene Plattform (seit Ende 2023): digitale
+--                      Wertpapiere im WIWIN-Wallet.  -> NICHT abgedeckt.
+--   Beide haben eigene Zugangsdaten; Investitionen sind nur in jeweils einem
+--   Portal sichtbar. Zugangsdaten = E-Mail und Passwort von invest.wiwin.de.
 --
 -- Bildet das Portfolio als Depot bei der Baader Bank ab: eine Position je
 -- Investition (aktueller Bestandswert, inkl. ISIN, Finanzinstrument, Kaufdatum,
@@ -57,8 +59,9 @@ WebBanking{
   -- Die Beschreibung erscheint im Kontoeinrichtungs-Dialog direkt bei der
   -- Eingabe der Zugangsdaten -- der naechstmoegliche Ort fuer einen Hinweis
   -- (MoneyMoney bietet keinen eigenen Popup-Mechanismus beim Login).
-  description = "Portfolio aus dem WIWIN-Kundenportal invest.wiwin.de (Partner Portagon). " ..
-                "Nur fuer diesen Login-Weg -- NICHT fuer wiwin-invest.de. " ..
+  description = "Portfolio aus dem WIWIN-Kundenportal invest.wiwin.de (Partner Portagon): " ..
+                "Wertpapiere mit Depot/Verrechnungskonto bei der Baader Bank. " ..
+                "NICHT fuer WIWINs eigene Plattform wiwin-invest.de (Wallet). " ..
                 "Zugangsdaten: E-Mail und Passwort von invest.wiwin.de."
 }
 
