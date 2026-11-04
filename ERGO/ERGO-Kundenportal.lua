@@ -772,7 +772,7 @@ end
 local function handleTerms (page, interactive)
   local text = termsText(page)
   print("ERGO verlangt Zustimmung zu geaenderten Nutzungsbedingungen:")
-  print(text:gsub("\n+", " | "))
+  print((text:gsub("\n+", " | ")))
 
   if TERMS_MODE == "auto" then
     return acceptAndOpen(page, "automatisch, TERMS_MODE = auto")
